@@ -48,7 +48,6 @@ BREAST_CANCER_ICON_FILE = BASE_DIR / "assets" / "breast-cancer-icon.png"
 HEART_DISEASE_ICON_FILE = BASE_DIR / "assets" / "heart-disease-icon.png"
 BRAIN_STROKE_ICON_FILE = BASE_DIR / "assets" / "brain-stroke-icon.png"
 CLINICAL_CHATBOT_DIR = BASE_DIR / "clinical_chatbot"
-CLINICAL_CHATBOT_PORT = 8000
 AGENTIC_DIAGNOSTIC_DIR = Path(
     os.environ.get(
         "AGENTIC_DIAGNOSTIC_DIR",
@@ -5051,30 +5050,6 @@ def agentic_diagnostic_page() -> None:
         height=1100,
         scrolling=True,
     )
-CHATBOT_BUILD_ID = "fast-start-v9"
-
-
-def _clinical_chatbot_health(port: int) -> dict | None:
-    """Return health JSON only for the expected bundled chatbot build."""
-    import urllib.request
-    try:
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/api/health", timeout=1.5
-        ) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        if payload.get("build") != CHATBOT_BUILD_ID:
-            return None
-        # The chatbot web server and Google Sheets are separate readiness
-        # concerns.  If FastAPI is alive and is the expected bundled build,
-        # allow the UI to load even when Google Sheets authentication is
-        # temporarily unavailable.  Sheet-backed actions will still report
-        # their own database error, but the chatbot interface itself must not
-        # be blocked by an unrelated credential failure.
-        return payload
-    except Exception:
-        return None
-
-
 def _port_is_free(port: int) -> bool:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -5084,92 +5059,8 @@ def _port_is_free(port: int) -> bool:
         return False
 
 
-def _ensure_clinical_chatbot_server() -> tuple[bool, str, int]:
-    """Start/reuse the bundled FastAPI chatbot and verify the exact build.
-
-    If an older chatbot process is still occupying the default port, use the
-    next free local port instead of accidentally embedding that stale server.
-    A previously verified port is checked first so reopening the chatbot does
-    not repeat the full multi-port discovery scan.
-    """
-    preferred = CLINICAL_CHATBOT_PORT
-
-    cached_port = st.session_state.get("_clinical_chatbot_port")
-    if isinstance(cached_port, int):
-        cached_health = _clinical_chatbot_health(cached_port)
-        if cached_health is not None:
-            return True, "", cached_port
-        st.session_state.pop("_clinical_chatbot_port", None)
-    # Do not spend up to 1.5 seconds probing every unused port.  An unused
-    # localhost port can be identified locally with no HTTP wait; only ports
-    # that are actually occupied need a health request.
-    port = None
-    for candidate in range(preferred, preferred + 12):
-        if _port_is_free(candidate):
-            if port is None:
-                port = candidate
-            continue
-        health = _clinical_chatbot_health(candidate)
-        if health is not None:
-            st.session_state["_clinical_chatbot_port"] = candidate
-            return True, "", candidate
-    if port is None:
-        return False, "No free local port was available for the Clinical Chatbot service.", preferred
-
-    chatbot_app = CLINICAL_CHATBOT_DIR / "app.py"
-    if not chatbot_app.is_file():
-        return False, f"Clinical chatbot files were not found at: {CLINICAL_CHATBOT_DIR}", port
-
-    log_path = CLINICAL_CHATBOT_DIR / "chatbot_server.log"
-    try:
-        creationflags = 0
-        startupinfo = None
-        if os.name == "nt":
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
-        log_handle = open(log_path, "a", encoding="utf-8")
-        subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "uvicorn",
-                "app:app",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-            ],
-            cwd=str(CLINICAL_CHATBOT_DIR),
-            stdout=log_handle,
-            stderr=log_handle,
-            stdin=subprocess.DEVNULL,
-            creationflags=creationflags,
-            startupinfo=startupinfo,
-        )
-
-        last_health = None
-        for _ in range(40):
-            last_health = _clinical_chatbot_health(port)
-            if last_health is not None:
-                st.session_state["_clinical_chatbot_port"] = port
-                return True, "", port
-            time.sleep(0.10)
-
-        return False, (
-            "The Clinical Chatbot service did not become healthy. "
-            f"See {log_path.name} in the clinical_chatbot folder."
-        ), port
-    except Exception as error:
-        return False, str(error), port
-
-
 def clinical_chatbot_page() -> None:
-    """Render the Clinical Chatbot as an in-process Streamlit page.
-
-    The chatbot no longer depends on the bundled FastAPI companion server,
-    so the same interface works locally and in the hosted cloud build."""
+    """Render the bundled HTML chatbot through Streamlit's in-process bridge."""
     identity = logged_in_patient_identity()
     allowed, message, subscription = service_access_allowed(
         str(identity["user_id"]), "clinical_chatbot"
@@ -5186,6 +5077,7 @@ def clinical_chatbot_page() -> None:
             st.session_state.active_page = "dashboard"
             st.rerun()
         st.stop()
+
     from clinical_chatbot_streamlit import render_clinical_chatbot_page
     render_clinical_chatbot_page()
 

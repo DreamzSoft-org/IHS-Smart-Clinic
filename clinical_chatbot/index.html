@@ -1344,7 +1344,9 @@
         if (!res.ok) return null;
         const data = await res.json();
         const appts = (data.appointments || []).slice().filter(a =>
-          (a.status === 'scheduled' || a.status === 'waitlisted') &&
+          ['scheduled', 'waitlisted'].includes(String(a.status || '').trim().toLowerCase()) &&
+          Number.isFinite(Date.parse(a.date || '')) &&
+          Date.parse(a.date) > Date.now() &&
           (!specialist || (a.specialist || '').toLowerCase() === specialist.toLowerCase())
         );
         appts.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
@@ -1376,6 +1378,9 @@
       const existing = window._pendingBooking?.existingAppointment;
       if (!existing || existing.appointment_id !== appointmentId) {
         addBotMessage('I could not find your existing appointment. Please try again.', 'Appointment');
+        window._pendingBooking = null;
+        lastRoute = null;
+        unlockInput();
         return;
       }
       const newReason = (PATIENT?.visit_reason || PATIENT?.reason || '').trim();
@@ -1399,10 +1404,14 @@
             updates: { reason: combinedReason },
           }),
         });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
         hideTyping();
         if (!res.ok) {
-          addBotMessage('Could not update your appointment right now. Please try booking again or contact support.', 'Error');
+          addBotMessage(
+            data.detail || data.message ||
+            'Could not update your appointment right now. Please try booking again or contact support.',
+            'Error'
+          );
           return;
         }
         addBotMessage('Okay — I updated your existing appointment with the new symptom.');
@@ -1410,6 +1419,11 @@
       } catch (err) {
         hideTyping();
         addBotMessage('I could not update your appointment right now. Please try again.', 'Error');
+      } finally {
+        window._pendingBooking = null;
+        lastRoute = null;
+        unlockInput();
+        saveSession();
       }
     }
 
@@ -1925,8 +1939,8 @@
         saveSession();
         return;
       }
-      if (route === 'meta') {
-        // Answer to "what are my symptoms / what did I tell you" — plain text, no cards.
+      if (route === 'meta' || route === 'general_health') {
+        // Meta replies and general health answers are plain text, not assessment cards.
         addBotMessage(out.display_text || "Here's a summary of what you've shared so far.");
         lastRoute = null;
         saveSession();

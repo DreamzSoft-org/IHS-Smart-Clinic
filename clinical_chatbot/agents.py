@@ -31,9 +31,22 @@ import database as db
 from mcp_tools import check_emergency, check_medication_conflicts, manage_appointment
 
 AGENTS_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(AGENTS_BASE_DIR, ".env"))
 
 logger = logging.getLogger("cdss.agents")
+
+# Load chatbot-local settings first, then fill missing values from the shared
+# project-root .env. Existing process environment variables keep precedence.
+load_dotenv(os.path.join(AGENTS_BASE_DIR, ".env"))
+for _provider_setting in (
+    "GROQ_API_KEY", "GROQ_MODEL",
+    "CEREBRAS_API_KEY", "CEREBRAS_MODEL",
+    "GEMINI_API_KEY", "GEMINI_MODEL", "GEMINI_VISION_MODEL",
+    "OPENROUTER_API_KEY", "OPENROUTER_MODEL",
+    "OLLAMA_BASE_URL", "OLLAMA_MODEL",
+):
+    if not os.environ.get(_provider_setting):
+        os.environ.pop(_provider_setting, None)
+load_dotenv(os.path.join(AGENTS_BASE_DIR, "..", ".env"))
 
 # Generic, patient-facing message used whenever every configured LLM provider
 # fails. The real exception chain (provider names, status codes, rate-limit
@@ -81,7 +94,7 @@ def _build_llm(provider: str):
     if provider == "ollama":
         raw_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
         return ChatOllama(
-            model=os.environ.get("OLLAMA_MODEL", "qwen2.5:1.5b"),
+            model=os.environ.get("OLLAMA_MODEL") or "qwen2.5:1.5b",
             base_url=_normalize_ollama_base_url(raw_url),
             temperature=0,
             validate_model_on_init=False,
@@ -1216,6 +1229,7 @@ _META_QUESTION_PATTERN = re.compile(
     r"|\b(list\s+(my|the)\s+symptoms?)"
     r"|\b(what\s+symptoms?\s+(do\s+i\s+have|have\s+i\s+mentioned|did\s+i\s+mention))"
     r"|\b(what\s+(kind\s+of\s+)?(problem|issue|condition|disease|illness)\s+(do\s+i\s+have|is\s+it))"
+    r"|\b(what(?:'s|\s+is)\s+wrong\s+with\s+me)"
     r"|\b(based\s+on\s+(my\s+)?(symptoms?|what\s+i\s+(said|told)))",
     re.IGNORECASE,
 )
@@ -1239,7 +1253,9 @@ _META_QUESTION_CANON = [
 ]
 
 
-def _fuzzy_matches(text: str, canon_phrases: list[str], threshold: int = 82) -> bool:
+def _fuzzy_matches(
+    text: str, canon_phrases: list[str], threshold: int = 82, partial: bool = True
+) -> bool:
     """True if `text` is a close typo/paraphrase match to one of the
     canonical phrases. Only applied to short inputs (<=8 words) — beyond
     that, a message is almost always a real symptom description rather
@@ -1247,7 +1263,8 @@ def _fuzzy_matches(text: str, canon_phrases: list[str], threshold: int = 82) -> 
     stripped = text.strip().lower()
     if not stripped or len(stripped.split()) > 8:
         return False
-    return any(fuzz.partial_ratio(stripped, phrase) >= threshold for phrase in canon_phrases)
+    scorer = fuzz.partial_ratio if partial else fuzz.ratio
+    return any(scorer(stripped, phrase) >= threshold for phrase in canon_phrases)
 
 
 # Order-independent backstop for the phrase-level checks above. Real
@@ -1265,12 +1282,12 @@ _QUESTION_START_PATTERN = re.compile(r"^(what|which|why|how|do|is|are)\b", re.IG
 
 
 def _looks_like_diagnostic_query(text: str) -> bool:
-    """True for short, clearly-interrogative messages containing a
-    diagnostic keyword ('symptom', 'disease', ...) in any order/spelling,
-    PROVIDED the message doesn't also carry a genuine new symptom
-    description (checked via _symptom_bearing) — so a real new complaint
-    like "what's wrong, I also have chest pain now?" still reaches the
-    symptom checker instead of being swallowed as a recall question."""
+    """True for short, clearly-interrogative questions about the patient's
+    own symptoms or diagnosis, including misspellings and unusual word order.
+
+    General educational questions such as "What are common symptoms of
+    diabetes?" must not be mistaken for requests to recall this conversation.
+    """
     stripped = text.strip()
     if not stripped or len(stripped.split()) > 10:
         return False
@@ -1280,6 +1297,14 @@ def _looks_like_diagnostic_query(text: str) -> bool:
     words = [w for w in re.findall(r"[a-zA-Z]+", stripped.lower()) if len(w) > 3]
     has_diagnostic_word = any(fuzz.ratio(w, kw) >= 82 for w in words for kw in _META_QUESTION_KEYWORDS)
     if not has_diagnostic_word:
+        return False
+    asks_about_patient = bool(re.search(
+        r"\b(my|do\s+i\s+have|what\s+do\s+i\s+have|i\s+have|i\s+feel|"
+        r"i\s+am|i'm|these|those)\b",
+        stripped,
+        re.IGNORECASE,
+    ))
+    if not asks_about_patient:
         return False
     return not _symptom_bearing(stripped)
 
@@ -1292,7 +1317,7 @@ def _looks_like_meta_question(text: str) -> bool:
     hallucinate symptoms."""
     if _META_QUESTION_PATTERN.search(text):
         return True
-    if _fuzzy_matches(text, _META_QUESTION_CANON):
+    if _fuzzy_matches(text, _META_QUESTION_CANON, partial=False):
         return True
     return _looks_like_diagnostic_query(text)
 
@@ -1328,11 +1353,17 @@ def _chitchat_category(text: str) -> Optional[str]:
     stripped = text.strip()
     if len(stripped.split()) > 12:
         return None
-    if _CHITCHAT_GREETING_PATTERN.search(stripped) or _fuzzy_matches(stripped, _CHITCHAT_GREETING_CANON, threshold=88):
+    if _CHITCHAT_GREETING_PATTERN.search(stripped) or _fuzzy_matches(
+        stripped, _CHITCHAT_GREETING_CANON, threshold=88, partial=False
+    ):
         return "greeting"
-    if _CHITCHAT_THANKS_PATTERN.search(stripped) or _fuzzy_matches(stripped, _CHITCHAT_THANKS_CANON, threshold=80):
+    if _CHITCHAT_THANKS_PATTERN.search(stripped) or _fuzzy_matches(
+        stripped, _CHITCHAT_THANKS_CANON, threshold=80, partial=False
+    ):
         return "thanks"
-    if _CHITCHAT_ACK_PATTERN.search(stripped) or _fuzzy_matches(stripped, _CHITCHAT_ACK_CANON, threshold=88):
+    if _CHITCHAT_ACK_PATTERN.search(stripped) or _fuzzy_matches(
+        stripped, _CHITCHAT_ACK_CANON, threshold=88, partial=False
+    ):
         return "ack"
     if _CHITCHAT_COMPLIMENT_PATTERN.search(stripped):
         return "compliment"
@@ -1408,6 +1439,27 @@ def _symptom_bearing(text: str) -> bool:
     return any(fuzz.ratio(word, kw) >= 84 for word in words for kw in _SYMPTOM_KEYWORDS)
 
 
+def _appointment_is_upcoming(
+    appointment: dict, now: Optional[datetime] = None
+) -> bool:
+    """Return whether an appointment has a parseable date/time in the future."""
+    raw_date = str(appointment.get("date") or "").strip()
+    if not raw_date:
+        return False
+
+    try:
+        appointment_dt = datetime.fromisoformat(raw_date)
+    except ValueError:
+        try:
+            appointment_dt = dateutil_parser.parse(raw_date)
+        except (ValueError, TypeError, OverflowError):
+            return False
+
+    appointment_dt = appointment_dt.astimezone()
+    current_dt = (now or datetime.now()).astimezone()
+    return appointment_dt > current_dt
+
+
 def _appointment_management_redirect(patient_id: str) -> dict:
     """Deterministic short-circuit for messages about an EXISTING
     appointment (reschedule/cancel/change time/change mode) — these are not a
@@ -1422,17 +1474,7 @@ def _appointment_management_redirect(patient_id: str) -> dict:
         logger.warning("Could not fetch appointments for management redirect (patient_id=%s)", patient_id, exc_info=True)
         all_active = []
 
-    # Strip appointments whose date has already passed — they have active
-    # status (e.g. "scheduled") but the time slot is gone.
-    now = datetime.now()
-    appointments = []
-    for a in all_active:
-        try:
-            appt_dt = datetime.fromisoformat(str(a.get("date", "")))
-            if appt_dt > now:
-                appointments.append(a)
-        except (ValueError, TypeError):
-            appointments.append(a)  # keep if date is unparseable
+    appointments = [a for a in all_active if _appointment_is_upcoming(a)]
 
     if appointments:
         text = (
@@ -1567,24 +1609,64 @@ _INTENT_CLASSIFIER_SYSTEM_PROMPT = """You classify a patient's chat message into
 Categories:
 - "symptom": clearly describes a new or ongoing health complaint/symptom they want assessed (e.g. "I have a headache", "my stomach hurts", "not feeling well since yesterday")
 - "appointment_management": about an appointment they already have or want to change — rescheduling, cancelling, changing the date/time/mode/slot, or asking what's booked (e.g. "can we change the slot?", "I need to cancel", "move my appointment to tomorrow")
-- "unclear": default to this whenever you are not confident — very short messages, garbled/typo'd text, texting-style abbreviations, or anything that doesn't clearly name a bodily symptom or clearly reference an appointment
+- "health_question": asks for general health information, wellness or prevention guidance, an explanation of a condition/term, or general medication information, without describing a personal symptom that needs assessment (e.g. "What is blood pressure?", "What causes diabetes?", "How does insulin work?", "Can ibuprofen affect blood pressure?")
+- "unclear": default to this whenever you are not confident — very short messages, garbled/typo'd text, texting-style abbreviations, or anything that doesn't clearly fit another category
 
 Bias strongly toward "unclear" for short or garbled input rather than guessing "symptom". A message only earns "symptom" when it names an actual bodily complaint (pain, ache, fever, a body part, "not feeling well", etc.) — the mere absence of appointment-sounding words is NOT evidence of a symptom.
+When the patient reports their own symptom and asks what to do, choose "symptom", not "health_question". Hypothetical or educational questions about a symptom or condition are "health_question".
 
 Examples:
 "chng the clot" -> unclear (garbled — reads like a typo'd "change the slot", not a body complaint; don't assume "clot" means the medical term here)
 "asdfgh" -> unclear
 "apt tmrw?" -> appointment_management
 "my chest hurts" -> symptom
+"I have a headache, what should I do?" -> symptom
+"What causes headaches?" -> health_question
+"What is blood pressure?" -> health_question
 "cancel" -> appointment_management
 
-Respond with ONLY a JSON object: {"intent": "symptom" | "appointment_management" | "unclear"}
+Respond with ONLY a JSON object: {"intent": "symptom" | "appointment_management" | "health_question" | "unclear"}
 Output nothing but the JSON object."""
 
 
+_GENERAL_HEALTH_QUESTION_START = re.compile(
+    r"^(what|how|why|when|which|can|could|does|do|is|are|should|"
+    r"tell\s+me|explain|symptoms?\s+of|causes?\s+of|side\s+effects?\s+of|"
+    r"treatment\s+for)\b",
+    re.IGNORECASE,
+)
+_GENERAL_HEALTH_TERMS = re.compile(
+    r"\b(symptoms?|blood\s+pressure|high\s+bp|hypertension|heart\s+rate|"
+    r"blood\s+sugar|diabetes|insulin|cholesterol|medicine|medication|drug|"
+    r"side\s+effects?|vaccine|vaccination|infection|flu|cold|fever|headache|"
+    r"pain|nausea|sleep|diet|exercise|hydration|pregnan\w*|asthma|allerg\w*|"
+    r"antibiotics?|treatment|health|wellness|disease|illness|symptom)\b",
+    re.IGNORECASE,
+)
+_PERSONAL_SYMPTOM_STATEMENT = re.compile(
+    r"\b(i\s+have|i've\s+got|i\s+feel|i'm\s+feeling|i\s+am\s+feeling|"
+    r"i'm\s+having|i\s+am\s+having|am\s+i\s+having|my\s+"
+    r"(?:head|chest|stomach|back|throat|ear|eye|joint|muscle|skin|"
+    r"body|symptom|pain|ache|fever|cough|nausea|rash|dizziness|breath))\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_general_health_question(text: str) -> bool:
+    """Recognize straightforward educational questions without relying on an LLM."""
+    stripped = (text or "").strip()
+    if not stripped or not _GENERAL_HEALTH_QUESTION_START.match(stripped):
+        return False
+    if not _GENERAL_HEALTH_TERMS.search(stripped):
+        return False
+    if _PERSONAL_SYMPTOM_STATEMENT.search(stripped):
+        return False
+    return True
+
+
 async def _classify_message_intent(text: str) -> Optional[str]:
-    """LLM-based classification of a free-text message into symptom /
-    appointment_management / unclear.
+    """Classify a free-text message into symptom, appointment, health question,
+    or unclear.
 
     Replaces regex-only routing for the primary intent decision: a keyword
     pattern has to enumerate every possible phrasing ("change the slot" vs
@@ -1609,7 +1691,7 @@ async def _classify_message_intent(text: str) -> Optional[str]:
             )
             parsed = parse_llm_response(response)
             intent = parsed.get("intent") if isinstance(parsed, dict) else None
-            if intent in ("symptom", "appointment_management", "unclear"):
+            if intent in ("symptom", "appointment_management", "health_question", "unclear"):
                 return intent
             logger.warning("Intent classifier on %s returned unusable output: %r", provider, parsed)
         except Exception as exc:
@@ -1619,21 +1701,21 @@ async def _classify_message_intent(text: str) -> Optional[str]:
 
 
 async def _resolve_intent(text: str) -> str:
-    """Returns 'symptom', 'appointment_management', or 'unclear'.
+    """Return a supported top-level chat intent.
 
     Tries the LLM classifier first. If every provider is unreachable, falls
-    back to the narrow appointment-keyword regex as a safety net — and if
-    even that doesn't match, returns 'unclear' rather than silently
-    assuming the message is a symptom. That's the key behavior change: an
-    unrecognized message now surfaces a clarifying menu to the patient
-    instead of being guessed into the symptom checker.
+    back to the narrow appointment-keyword regex and returns 'unclear' rather
+    than silently assuming an unrecognized message is a symptom.
     """
+    if _looks_like_appointment_management(text):
+        return "appointment_management"
+    if _looks_like_general_health_question(text):
+        return "health_question"
+
     intent = await _classify_message_intent(text)
     if intent is not None:
         return intent
     logger.warning("All LLM providers unavailable for intent classification; falling back to keyword heuristic.")
-    if _looks_like_appointment_management(text):
-        return "appointment_management"
     return "unclear"
 
 
@@ -1641,18 +1723,65 @@ def _intent_clarify_menu() -> dict:
     """Shown only when _resolve_intent can't confidently tell whether a
     fresh message is a symptom or about an existing appointment. The
     frontend should render intent_options as tappable buttons rather than
-    asking the patient to retype anything. When the patient picks one,
-    call run_patient_symptom_flow(..., forced_intent=<the id they picked>)
-    so the choice is used directly instead of re-classifying their tap."""
+    asking the patient to retype anything. The "other" option routes the
+    original question to the general health assistant."""
     return {
         "route": "intent_clarify",
         "display_text": "Just to make sure I help with the right thing — is this about:",
         "intent_options": [
             {"id": "symptom", "label": "A symptom or health concern"},
             {"id": "appointment_management", "label": "An existing appointment"},
-            {"id": "other", "label": "Something else"},
+            {"id": "other", "label": "A general health question"},
         ],
     }
+
+
+GENERAL_HEALTH_SYSTEM_PROMPT = """You are a general health information assistant for a clinic. Answer the patient's health-related question directly, clearly, and in plain language. Provide general education and prevention information, not a diagnosis or a substitute for professional care. Include one brief, relevant safety precaution in every answer; avoid generic boilerplate when a specific precaution is more useful.
+
+Do not claim to know the patient's medical history, medications, allergies, or test results unless they explicitly shared them in this conversation. Do not diagnose an individual, prescribe medication, or tell someone to start, stop, or change a prescribed treatment. For questions about whether a medicine is safe for that person, give cautious general information, explain that safety depends on their conditions and other medicines, and recommend checking with their clinician or pharmacist. Do not invent sources, statistics, or citations.
+
+If the question describes symptoms happening to the patient, do not guess a cause; encourage them to describe the symptoms for the clinic's symptom-assessment flow. If they describe possible immediate danger (for example severe chest pain, trouble breathing, stroke signs, overdose, or risk of self-harm), advise contacting local emergency services or going to an emergency department now.
+
+Keep the answer relevant to the question. If it is ambiguous, ask one brief follow-up question. If it is not health-related, politely say you can help with health information, symptom assessment, lab reports, and appointments."""
+
+
+async def run_general_health_agent(question: str) -> dict:
+    """Answer general health questions without invoking symptom or appointment tools."""
+    messages = [
+        {"role": "system", "content": GENERAL_HEALTH_SYSTEM_PROMPT},
+        {"role": "user", "content": question.strip()},
+    ]
+
+    failures = []
+    try:
+        providers = _get_llm_chain()
+    except Exception as exc:
+        logger.error("General health assistant could not initialize an LLM provider: %s", exc, exc_info=True)
+        return {"route": "error", "display_text": LLM_UNAVAILABLE_MESSAGE}
+
+    for provider, llm_instance in providers:
+        try:
+            response = await asyncio.wait_for(
+                llm_instance.ainvoke(messages),
+                timeout=AGENT_TIMEOUT_SECONDS,
+            )
+            content = getattr(response, "content", response)
+            if isinstance(content, list):
+                content = "\n".join(
+                    part if isinstance(part, str) else str(part.get("text") or "")
+                    for part in content
+                    if isinstance(part, (str, dict))
+                )
+            answer = str(content or "").strip()
+            if answer:
+                return {"route": "general_health", "display_text": answer}
+            failures.append(f"{provider}: returned an empty answer")
+        except Exception as exc:
+            failures.append(f"{provider}: {exc}")
+            logger.warning("General health answer failed on %s: %s", provider, exc)
+
+    logger.error("All configured providers failed for general health question: %s", "; ".join(failures))
+    return {"route": "error", "display_text": LLM_UNAVAILABLE_MESSAGE}
 
 
 def _meta_question_response(session_history: list[dict]) -> dict:
@@ -1692,7 +1821,9 @@ def _meta_question_response(session_history: list[dict]) -> dict:
             continue
         if _looks_like_meta_question(content) or _looks_like_chitchat(content):
             continue
-        if _symptom_bearing(content) or len(content.split()) > 3:
+        if _looks_like_general_health_question(content):
+            continue
+        if _symptom_bearing(content):
             symptom_turns.append(content)
 
     # Extract lab-report findings stored earlier this session.
@@ -1808,21 +1939,13 @@ async def run_patient_symptom_flow(patient_id: str, user_input: str, clarifying_
     "Book Appointment". EMERGENCY skips all of this.
 
     forced_intent: set when the patient just tapped an option on the
-    _intent_clarify_menu() card ("symptom" / "appointment_management" /
-    "other"). Bypasses classification entirely so their tap is honored
-    directly instead of re-classifying it (a bare word like "symptom"
-    would otherwise be a strange thing to classify).
+    _intent_clarify_menu() card. Bypasses classification so the original
+    question follows the selected symptom, appointment, or general-health path.
     """
     if forced_intent == "appointment_management":
         return _appointment_management_redirect(patient_id)
     if forced_intent == "other":
-        return {
-            "route": "meta",
-            "display_text": (
-                "No problem — you can ask me anything health-related, or let me know "
-                "if there's something else I can help with."
-            ),
-        }
+        return await run_general_health_agent(user_input)
     # forced_intent == "symptom" (or None) falls through to the normal flow below.
 
     # --- Meta-question intercept: "what are my symptoms / what did I tell you"
@@ -1851,8 +1974,7 @@ async def run_patient_symptom_flow(patient_id: str, user_input: str, clarifying_
     ):
         try:
             upcoming = db.get_appointments(patient_id=patient_id, active_only=True)
-            now = datetime.now()
-            future = [a for a in upcoming if datetime.fromisoformat(a.get('date', '')) > now]
+            future = [a for a in upcoming if _appointment_is_upcoming(a)]
             if future:
                 return _appointment_management_redirect(patient_id)
             else:
@@ -1867,14 +1989,15 @@ async def run_patient_symptom_flow(patient_id: str, user_input: str, clarifying_
             # If DB fails, continue to symptom checker
             pass
 
-    # --- Intent classification (fresh message): is this a symptom, about an
-    # existing appointment, or unclear? A genuine "unclear" gets a tappable
-    # menu back instead of being silently assumed to be a symptom — see
-    # _resolve_intent / _intent_clarify_menu docstrings for why.
+    # --- Intent classification (fresh message): symptom, appointment,
+    # general health question, or unclear. A genuine "unclear" gets a
+    # tappable menu rather than being silently assumed to be a symptom.
     if clarify_round == 0 and clarifying_answer is None and forced_intent is None:
         intent = await _resolve_intent(user_input)
         if intent == "appointment_management":
             return _appointment_management_redirect(patient_id)
+        if intent == "health_question":
+            return await run_general_health_agent(user_input)
         if intent == "unclear":
             return _intent_clarify_menu()
         # intent == "symptom" -> continue to the checks below as before.
@@ -1891,6 +2014,8 @@ async def run_patient_symptom_flow(patient_id: str, user_input: str, clarifying_
         if pivot_intent == "appointment_management":
             _clear_visit_context(patient_id)
             return _appointment_management_redirect(patient_id)
+        if pivot_intent == "health_question":
+            return await run_general_health_agent(clarifying_answer)
 
     # --- Additive-symptom check: if the patient is clearly adding to prior
     # symptoms ("along with previous symptoms, I also feel fever"), treat it
