@@ -335,8 +335,10 @@ def _ws(tab: str):
         raise
 
 
-_CACHE_TTL_SECONDS = 4
+_CACHE_TTL_SECONDS = 15
 _cache: dict[str, tuple[float, list[dict]]] = {}
+_REGISTERED_DOCTOR_CACHE_TTL_SECONDS = 60
+_registered_doctor_cache: tuple[float, list[dict]] | None = None
 
 
 def _read_all(tab: str, force: bool = False) -> list[dict]:
@@ -497,10 +499,20 @@ def _registered_doctor_accounts() -> list[dict]:
     scheduling metadata such as specialty and working hours, but registration
     is the source of truth for who is a doctor.
     """
+    global _registered_doctor_cache
     if not is_available():
         return []
 
+    with _lock:
+        cached = _registered_doctor_cache
+        if (
+            cached
+            and time.time() - cached[0] < _REGISTERED_DOCTOR_CACHE_TTL_SECONDS
+        ):
+            return [doctor.copy() for doctor in cached[1]]
+
     doctors_by_id: dict[str, dict] = {}
+    read_failed = False
     try:
         worksheets = {
             ws.title: ws for ws in _call_with_retry(_spreadsheet.worksheets)
@@ -524,6 +536,7 @@ def _registered_doctor_accounts() -> list[dict]:
         try:
             values = _call_with_retry(ws.get_all_values)
         except Exception:
+            read_failed = True
             continue
         if len(values) < 2:
             continue
@@ -548,7 +561,11 @@ def _registered_doctor_accounts() -> list[dict]:
                 "specialty": record.get("specialty", "").strip(),
             }
 
-    return list(doctors_by_id.values())
+    doctors = list(doctors_by_id.values())
+    if not read_failed:
+        with _lock:
+            _registered_doctor_cache = (time.time(), doctors)
+    return [doctor.copy() for doctor in doctors]
 
 
 def _merged_registered_doctor(doctor_id: str) -> Optional[dict]:

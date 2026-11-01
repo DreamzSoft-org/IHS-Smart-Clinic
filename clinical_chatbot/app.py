@@ -95,6 +95,14 @@ def _safe_error(user_message: str, exc: Exception) -> HTTPException:
     detail is a short, patient-safe message — never the raw provider/agent
     error text (which can be long, technical, and expose internal config)."""
     logger.error("%s", exc, exc_info=True)
+    if getattr(getattr(exc, "response", None), "status_code", None) == 429:
+        return HTTPException(
+            status_code=503,
+            detail=(
+                "The clinic's Google Sheets request limit was temporarily "
+                "reached. Please wait a minute and try again."
+            ),
+        )
     return HTTPException(status_code=503, detail=user_message)
 
 

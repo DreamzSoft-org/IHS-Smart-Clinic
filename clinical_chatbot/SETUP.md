@@ -86,6 +86,11 @@ glass UI) and a conversational chatbot instead of separate tab forms.
 - A **Dashboard** tab (top right) holds appointment lookup and the
   doctor-schedule viewer, using "Acting As" the same way the old UI did.
 
+The integrated Streamlit app renders this same `index.html` through
+`clinical_chatbot_streamlit.py`. The chatbot's FastAPI app is called in-process
+through a request bridge, so the main launcher starts the full UI without
+requiring a separate chatbot server or startup step.
+
 ## 5. Real datasets, sourced not invented
 - **`cdss_otc_medications.csv`** — 26 real, genuinely non-prescription
   active ingredients (paracetamol, ibuprofen, loratadine, clotrimazole,
